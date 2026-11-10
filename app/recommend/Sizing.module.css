@@ -361,25 +361,6 @@
 .memSwatch { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
 .memLegendItem strong { color: var(--t); font-family: var(--mono); font-weight: 600; }
 
-/* ---------- warnings ---------- */
-.warningsList {
-  margin-top: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.warningItem {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 10px 14px;
-  background: #fdf7e7;
-  border: 1px solid #f0ab00;
-  border-radius: var(--radius);
-  font-size: 13px;
-  color: var(--t2);
-}
-
 /* ---------- additional constraints ---------- */
 .accordionWrap {
   margin-top: 8px;

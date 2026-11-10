@@ -9,6 +9,9 @@ export function friendlyErrorTitle(code: string | null): string {
     case 'AIC_NOT_CONFIGURED': return 'Service not configured';
     case 'AIC_UNSUPPORTED': return 'Configuration does not fit';
     case 'AIC_INVALID_RESPONSE': return 'Unexpected response';
+    case 'OOM': return 'Not enough GPU memory';
+    case 'AUTH_REQUIRED': return 'Authentication required';
+    case 'MODEL_NOT_FOUND': return 'Model not found';
     case 'INVALID_REQUEST': return 'Invalid input';
     case 'NETWORK_ERROR': return 'Connection error';
     default: return 'Something went wrong';
@@ -29,6 +32,12 @@ export function friendlyErrorMessage(code: string | null, raw: string): string {
       return 'This model and hardware combination is not supported, or the model is too large to fit on the selected GPU.';
     case 'AIC_INVALID_RESPONSE':
       return 'The sizing engine returned an unexpected response format.';
+    case 'OOM':
+      return 'This model requires more GPU memory than available with the current configuration.';
+    case 'AUTH_REQUIRED':
+      return 'This model is gated and requires a HuggingFace token to access.';
+    case 'MODEL_NOT_FOUND':
+      return 'This model was not found in the catalog. Check that the HuggingFace ID is correct and case-sensitive.';
     case 'INVALID_REQUEST':
       return 'Some input values are missing or invalid. Please check your model name and parameters.';
     case 'NETWORK_ERROR':
@@ -47,7 +56,12 @@ export function friendlyErrorHint(code: string | null): string {
     case 'AIC_UNAVAILABLE':
       return 'Wait a moment and try again.';
     case 'AIC_UNSUPPORTED':
-      return 'Try a GPU with more memory, reduce parallelism, or use a smaller/quantized model.';
+    case 'OOM':
+      return 'Try increasing tensor parallel size, using a quantized variant (FP8/INT4), or selecting a GPU with more memory.';
+    case 'AUTH_REQUIRED':
+      return 'Add your HuggingFace token in settings, then accept the model license on HuggingFace.';
+    case 'MODEL_NOT_FOUND':
+      return 'Check the HuggingFace ID is correct and case-sensitive (e.g. meta-llama/Llama-3.1-8B).';
     case 'NETWORK_ERROR':
       return 'Check your connection and try again.';
     case 'INVALID_REQUEST':

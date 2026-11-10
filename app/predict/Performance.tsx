@@ -12,7 +12,6 @@ import {
 import StarIcon from '@patternfly/react-icons/dist/esm/icons/star-icon';
 import OutlinedStarIcon from '@patternfly/react-icons/dist/esm/icons/outlined-star-icon';
 import CheckCircleIcon from '@patternfly/react-icons/dist/esm/icons/check-circle-icon';
-import ExclamationTriangleIcon from '@patternfly/react-icons/dist/esm/icons/exclamation-triangle-icon';
 import MicrochipIcon from '@patternfly/react-icons/dist/esm/icons/microchip-icon';
 import MemoryIcon from '@patternfly/react-icons/dist/esm/icons/memory-icon';
 import DollarSignIcon from '@patternfly/react-icons/dist/esm/icons/dollar-sign-icon';
@@ -38,6 +37,9 @@ import { TestedPerformanceFeedback } from '@/components/ui/TestedPerformanceFeed
 import { useCatalog, systemMemoryFraction, engineVersionSupport, type ModelSpec } from '@/lib/hooks/useCatalog';
 import { useTestedModels } from '@/lib/hooks/useTestedModels';
 import { testedSystemsFirst } from '@/lib/tested-models/registry-types';
+import { ErrorPanel } from '@/components/ui/ErrorPanel';
+// import { WarningPanel } from '@/components/ui/WarningPanel';
+//import { useAicCatalog, type ModelSpec } from '@/lib/hooks/useAicCatalog';
 import { GpuChipLoader } from '@/components/GpuChipLoader/GpuChipLoader';
 import { useSettings } from '@/contexts/SettingsContext';
 import { useCostings, resolveCloudRate } from '@/lib/hooks/useCostings';
@@ -49,10 +51,6 @@ import type { CanonicalClassifierInput, ClassifierPhaseInput } from '@/lib/teste
 import Link from 'next/link';
 import { HOURS_PER_MONTH, AMORT_MONTHS_3YR, AMORT_MONTHS_5YR } from '@/lib/utils/format';
 import { parsePerformancePrefill } from './performance-prefill';
-
-function modelSuggestions(): string {
-  return getAppConfig().suggestedModelNames.join(', ');
-}
 
 function detectMoe(spec: ModelSpec | undefined, hfConfig: HFModelConfig | null): boolean {
   const catalogExperts = spec?.num_experts ?? 0;
@@ -1534,95 +1532,10 @@ export default function Performance() {
       )}
 
       {/* ---------- validation warnings ---------- */}
-      {validationWarnings.length > 0 && (
-        <div style={{
-          padding: '16px 20px',
-          marginBottom: '20px',
-          background: '#fff8e1',
-          border: '2px solid #f0ab00',
-          borderRadius: '8px',
-          display: 'flex',
-          gap: '12px',
-          alignItems: 'flex-start'
-        }}>
-          <ExclamationTriangleIcon style={{ fontSize: '24px', color: '#f0ab00', flexShrink: 0 }} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: '600', color: '#795600', marginBottom: '8px', fontSize: '16px' }}>
-              Manual override validation warnings
-            </div>
-            <ul style={{ margin: 0, paddingLeft: '20px', fontSize: '14px', color: '#795600', lineHeight: '1.6' }}>
-              {validationWarnings.map((warning, i) => (
-                <li key={i}>{warning}</li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
+      {/* <WarningPanel warnings={validationWarnings} /> */}
 
       {/* ---------- error display ---------- */}
-      {testError && (
-        <div style={{
-          padding: '16px 20px',
-          marginBottom: '20px',
-          background: '#fff3cd',
-          border: '2px solid #ffc107',
-          borderRadius: '8px',
-          display: 'flex',
-          gap: '12px',
-          alignItems: 'flex-start'
-        }}>
-          <span style={{ fontSize: '24px', flexShrink: 0 }}>⚠️</span>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: '600', color: '#856404', marginBottom: '8px', fontSize: '16px' }}>
-               {testErrorCode === 'OOM' ? 'Not enough GPU memory'
-                 : testErrorCode === 'AUTH_REQUIRED' ? 'Authentication required'
-                 : testErrorCode === 'MODEL_NOT_FOUND' ? 'Model not found'
-                 : testErrorCode === 'SIMULATOR_MISMATCH' ? 'Simulator mismatch'
-                  : testErrorCode === 'AISIM_NO_CONFIGURATION' ? 'No valid configuration found'
-                  : testErrorCode === 'AISIM_TIMEOUT' ? 'Request timed out'
-                : testErrorCode === 'AISIM_UNAVAILABLE' ? 'Sizing service unavailable'
-                : 'Estimate failed'}
-            </div>
-
-            {testErrorCode === 'OOM' ? (
-              <div style={{ fontSize: '14px', color: '#664d03', lineHeight: '1.6' }}>
-                <p style={{ margin: '0 0 10px' }}>This model requires more GPU memory than available with the current tensor parallel size. Try one of:</p>
-                <ul style={{ margin: '0', paddingLeft: '20px', lineHeight: '1.8' }}>
-                  <li><strong>Increase tensor parallel size</strong> in the options above — double it and try again</li>
-                  <li><strong>Use a quantized variant</strong> — look for FP8 or INT4 versions of this model on HuggingFace</li>
-                  <li><strong>Select a larger GPU system</strong> — switch to a system with more VRAM per GPU</li>
-                </ul>
-              </div>
-            ) : testErrorCode === 'AUTH_REQUIRED' ? (
-              <div style={{ fontSize: '14px', color: '#664d03', lineHeight: '1.6' }}>
-                <p style={{ margin: '0 0 10px' }}>This model is gated and requires a HuggingFace token:</p>
-                <ul style={{ margin: '0', paddingLeft: '20px', lineHeight: '1.8' }}>
-                  <li>Add your token in the <strong>HuggingFace token</strong> field above</li>
-                  <li>Get a token at <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener" style={{ color: '#0066cc' }}>huggingface.co/settings/tokens</a></li>
-                  <li>Accept the model&apos;s license on HuggingFace first</li>
-                </ul>
-              </div>
-            ) : testErrorCode === 'AISIM_TIMEOUT' ? (
-              <div style={{ fontSize: '14px', color: '#664d03', lineHeight: '1.6' }}>
-                The sizing engine took too long to respond. Try again, or use a smaller model or simpler configuration.
-              </div>
-            ) : testErrorCode === 'MODEL_NOT_FOUND' ? (
-              <div style={{ fontSize: '14px', color: '#664d03', lineHeight: '1.6' }}>
-                <p style={{ margin: '0 0 10px' }}>This model wasn&apos;t found in the catalog. Check that:</p>
-                <ul style={{ margin: '0', paddingLeft: '20px', lineHeight: '1.8' }}>
-                  <li>The HuggingFace ID is correct and case-sensitive (e.g. <code>meta-llama/Llama-3.1-8B</code>)</li>
-                  <li>It&apos;s not a GGUF repo — use the base model instead</li>
-                  <li>Popular supported models: {modelSuggestions()}</li>
-                </ul>
-              </div>
-            ) : (
-              <div style={{ fontSize: '14px', color: '#664d03', lineHeight: '1.6' }}>
-                {testError}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      {testError && <ErrorPanel error={testError} errorCode={testErrorCode} />}
 
       <TestedPerformanceFeedback prediction={classifierPrediction} isLoading={classifierLoading} modelId={testClassifierInput?.effective.model_id ?? model} systemId={testClassifierInput?.effective.system_id ?? gpu} />
 
