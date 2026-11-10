@@ -21,6 +21,37 @@ function pricedModel(
 }
 
 describe('hosted pricing resolution', () => {
+  it.each([
+    ['Qwen/Qwen3-Coder-480B-A35B-Instruct', 'qwen/qwen3-coder'],
+    ['deepseek-ai/DeepSeek-V3', 'deepseek/deepseek-chat'],
+  ])('uses canonical checkpoint identity for %s', (checkpoint, id) => {
+    const price = { ...pricedModel(id, 'OpenRouter', 1, 2), hugging_face_id: checkpoint }
+    expect(resolveHostedPricing(checkpoint, [price], 2_000_000, 1_000_000).selected).toBe(price)
+  })
+
+  it.each([
+    'another-owner/Qwen3-8B',
+    'Qwen/Qwen3-8B-Instruct',
+    'deepseek-ai/DeepSeek-R1-Distill-Qwen-8B',
+    'Qwen/Qwen3-8B-0528',
+    'malformed-checkpoint',
+  ])('does not override conflicting canonical identity %s with a matching slug', checkpoint => {
+    const price = { ...pricedModel('qwen/qwen3-8b', 'OpenRouter', 1, 2), hugging_face_id: checkpoint }
+    expect(resolveHostedPricing('Qwen/Qwen3-8B', [price], 1, 1).selected).toBeNull()
+  })
+
+  it('preserves explicit serving-format aliases with canonical metadata', () => {
+    const price = { ...pricedModel('provider/unrelated-slug', 'Provider', 1, 2), hugging_face_id: 'Qwen/Qwen3-32B' }
+    expect(resolveHostedPricing('Qwen/Qwen3-32B-FP8', [price], 1, 1).selected).toBe(price)
+    const llama = { ...price, hugging_face_id: 'meta-llama/Meta-Llama-3.1-70B-Instruct' }
+    expect(resolveHostedPricing('nvidia/Llama-3.1-70B-Instruct-FP8', [llama], 1, 1).selected).toBe(llama)
+  })
+
+  it.each([null, undefined, ''])('retains legacy matching without a canonical identity: %s', checkpoint => {
+    const price = { ...pricedModel('qwen/qwen3-8b', 'Provider', 1, 2), hugging_face_id: checkpoint }
+    expect(resolveHostedPricing('Qwen/Qwen3-8B', [price], 1, 1).selected).toBe(price)
+  })
+
   it('selects the cheapest provider for the actual token mix', () => {
     const prices = [
       pricedModel('deepinfra/deepseek-ai/DeepSeek-R1', 'DeepInfra', 0.4, 2),
@@ -66,6 +97,23 @@ describe('hosted pricing resolution', () => {
 
     expect(result.selected?.provider).toBe('Llamagate')
     expect(result.matches.map(match => match.provider)).toEqual(['Llamagate', 'OpenRouter'])
+  })
+
+  it('preserves distinct pricing sources while deduplicating aliases within each source', () => {
+    const prices: FrontierModel[] = [
+      { ...pricedModel('route-a/owner/model-a', 'Provider A', 1, 2), source: 'openrouter' },
+      { ...pricedModel('route-b/owner/model-a', ' Provider A ', 2, 3), source: 'openrouter' },
+      { ...pricedModel('route-c/owner/model-a', 'provider a', 1.5, 2), source: 'litellm' },
+    ]
+    const originalOrder = prices.map(offer => offer.id)
+    const result = resolveHostedPricing('owner/model-a', prices, 2_000_000, 1_000_000)
+
+    expect(result.providerMatches.map(offer => offer.id)).toEqual([
+      'route-a/owner/model-a', 'route-c/owner/model-a',
+    ])
+    expect(result.selected).toBe(prices[0])
+    expect(result.matches).toHaveLength(3)
+    expect(prices.map(offer => offer.id)).toEqual(originalOrder)
   })
 
   it('uses the same hosted model price for a serving-format checkpoint', () => {

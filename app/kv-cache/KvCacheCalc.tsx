@@ -5,7 +5,8 @@ import { Label, Spinner } from '@patternfly/react-core'
 import CheckCircleIcon from '@patternfly/react-icons/dist/esm/icons/check-circle-icon'
 import { formatBytes } from '@/lib/utils/format'
 import { useCountUp } from '@/app/predict/performanceHelpers'
-import { useCatalog } from '@/lib/hooks/useCatalog'
+import { hasDefaultMemoryFractionForVersion, systemMemoryFraction, useCatalog } from '@/lib/hooks/useCatalog'
+import { useTestedModels } from '@/lib/hooks/useTestedModels'
 import { useSettings, type InferenceBackend } from '@/contexts/SettingsContext'
 import { useKvCache, type PhaseResult } from '@/contexts/KvCacheContext'
 import { getAppConfig } from '@/lib/app-config'
@@ -58,7 +59,8 @@ function invalidPhaseParallel(p: PhaseParallelInput): boolean {
 
 export default function KvCacheCalc() {
   const { hydrated, hfToken, defaultModel: settingsDefaultModel, inferenceBackend, backendVersion: settingsBackendVersion } = useSettings()
-  const { modelOptions: catalogModels, gpuOptions: catalogGpus, backendOptions, isLoading: catalogLoading } = useCatalog()
+  const { modelOptions: catalogModels, gpuOptions: catalogGpus, modelSpecs, backendOptions, isLoading: catalogLoading } = useCatalog()
+  const { validatedModelIds, isAvailable: testedModelsAvailable } = useTestedModels()
   const MODEL_OPTIONS = catalogModels
 
   const [model, setModel] = React.useState('')
@@ -75,6 +77,7 @@ export default function KvCacheCalc() {
     setBackend(inferenceBackend)
     setBackendVersion(settingsBackendVersion)
   }, [hydrated, settingsDefaultModel, inferenceBackend, settingsBackendVersion])
+
   const [maxNumTokens, setMaxNumTokens] = React.useState(8192)
   const [maxBatchSize, setMaxBatchSize] = React.useState(128)
   const [tpSize, setTpSize] = React.useState(1)
@@ -87,6 +90,7 @@ export default function KvCacheCalc() {
   const [decodePar, setDecodePar] = React.useState<PhaseParallelInput>({ tp: '1', pp: '1', moeTp: '', moeEp: '' })
   const [memFractionKind, setMemFractionKind] = React.useState('of_total')
   const [memFractionValue, setMemFractionValue] = React.useState(1.0)
+  const memFractionValueUserEdited = React.useRef(false)
   const [advancedOpen, setAdvancedOpen] = React.useState(false)
   const { isLoading: loading, results, error, errorCode, debugRequest, debugResponse, debugStatus, debugDuration, startCalc } = useKvCache()
   const [debugOpen, setDebugOpen] = React.useState(false)
@@ -97,11 +101,39 @@ export default function KvCacheCalc() {
   const [ppSizeInput, setPpSizeInput] = React.useState('1')
   const [memFractionValueInput, setMemFractionValueInput] = React.useState('1.0')
 
+  // Use the selected backend's catalog defaults for the memory controls. The
+  // fields remain editable after the backend default has been applied.
+  // The fraction is version-keyed, so prefer the selected system's own default;
+  // the backend-level figure only describes the fleet's majority version.
+  React.useEffect(() => {
+    if (!hydrated || catalogLoading) return
+    const selectedBackend = backendOptions.find(option => option.id === backend)
+    if (!selectedBackend) return
+
+    const fraction = systemMemoryFraction(selectedBackend, system)
+    if (fraction != null) {
+      if (!memFractionValueUserEdited.current) {
+        setMemFractionValue(fraction)
+        setMemFractionValueInput(String(fraction))
+      }
+    } else if (!memFractionValueUserEdited.current) {
+      setMemFractionValue(1.0)
+      setMemFractionValueInput('1.0')
+    }
+    setMemFractionKind(selectedBackend.memoryFractionKind)
+  }, [backend, backendOptions, catalogLoading, hydrated, system])
+
   const invalidMaxNumTokens = maxNumTokensInput === '' || parseInt(maxNumTokensInput, 10) < 1;
   const invalidMaxBatchSize = maxBatchSizeInput === '' || parseInt(maxBatchSizeInput, 10) < 1;
   const invalidTpSize = tpSizeInput === '' || parseInt(tpSizeInput, 10) < 1;
   const invalidPpSize = ppSizeInput === '' || parseInt(ppSizeInput, 10) < 1;
-  const invalidMemFractionValue = memFractionValueInput === '' || !Number.isFinite(Number(memFractionValueInput)) || Number(memFractionValueInput) < 0 || Number(memFractionValueInput) > 1;
+  const selectedBackend = backendOptions.find(option => option.id === backend)
+  const needsExplicitMemFraction = Boolean(
+    backendVersion.trim() &&
+    !memFractionValueUserEdited.current &&
+    !hasDefaultMemoryFractionForVersion(selectedBackend, system, backendVersion),
+  )
+  const invalidMemFractionValue = needsExplicitMemFraction || memFractionValueInput === '' || !Number.isFinite(Number(memFractionValueInput)) || Number(memFractionValueInput) < 0 || Number(memFractionValueInput) > 1;
   const invalidParallelism = servingMode === 'disagg'
     ? invalidPhaseParallel(prefillPar) || invalidPhaseParallel(decodePar)
     : invalidTpSize || invalidPpSize;
@@ -121,7 +153,7 @@ export default function KvCacheCalc() {
   };
 
   // eslint-disable-next-line react-hooks/exhaustive-deps -- hydrated gates config.json readiness
-  const modelItems: ComboBoxItem[] = React.useMemo(() => buildModelItems(catalogModels), [catalogModels, hydrated]);
+  const modelItems: ComboBoxItem[] = React.useMemo(() => buildModelItems(catalogModels, modelSpecs, validatedModelIds), [catalogModels, modelSpecs, validatedModelIds, hydrated]);
 
   // HF config for models AISimulators can't resolve from its catalog (incl. tested models
   // outside the catalog). Fetched on model change, sent to /api/memory on calc.
@@ -155,6 +187,7 @@ export default function KvCacheCalc() {
   };
 
   const handleMemFractionValueChange = (raw: string) => {
+    memFractionValueUserEdited.current = true
     const cleaned = raw.replace(/[^0-9.]/g, '');
     setMemFractionValueInput(cleaned);
     const n = Number(cleaned);
@@ -200,6 +233,9 @@ export default function KvCacheCalc() {
         <p className={styles.subtitle}>
           Calculate KV cache memory requirements for any model on supported GPU systems
         </p>
+        <div className={styles.helperText}>
+          Memory estimates use AISimulate, independent of the global Simulator setting.
+        </div>
       </div>
 
       {/* Input card */}
@@ -213,7 +249,7 @@ export default function KvCacheCalc() {
               items={modelItems}
               placeholder="Type model name or select from dropdown..."
               allowCustom
-              supportedModels={getAppConfig().testedModels}
+              supportedModels={testedModelsAvailable ? validatedModelIds : undefined}
             />
           </div>
 
@@ -230,6 +266,11 @@ export default function KvCacheCalc() {
             {loading ? 'Calculating…' : 'Calculate'}
           </button>
         </div>
+        {needsExplicitMemFraction && (
+          <div className={styles.helperText} role="status" aria-live="polite">
+            This version differs from the system default. Enter a memory fraction for the pinned version.
+          </div>
+        )}
 
         {/* Advanced settings accordion */}
         <button
@@ -259,7 +300,13 @@ export default function KvCacheCalc() {
                 <select
                   id="kv-backend"
                   value={backend}
-                  onChange={e => setBackend(e.target.value)}
+                  onChange={e => {
+                    const nextBackend = e.target.value
+                    if (systemMemoryFraction(backendOptions.find(option => option.id === nextBackend), system) != null) {
+                      memFractionValueUserEdited.current = false
+                    }
+                    setBackend(nextBackend)
+                  }}
                   className={styles.gpuSelect}
                 >
                   {backendOptions.map(option => (

@@ -15,15 +15,25 @@ import {
 } from '@patternfly/react-core'
 import TimesIcon from '@patternfly/react-icons/dist/esm/icons/times-icon'
 import { getAppConfig } from '@/lib/app-config'
+import type { ModelFacets } from '@/lib/model-metadata'
+import { searchModels } from '@/lib/model-search'
 import styles from './ModelComboBox.module.css'
 
-export interface ComboBoxItem {
+interface ComboBoxOption {
   value: string
   label: string
   group: string
+  description?: string
   isTested?: boolean
   inCatalog?: boolean
   isHuggingFace?: boolean
+}
+
+/** Model rows carry searchable facets; provider/hardware rows remain plain options. */
+export type ComboBoxItem = ComboBoxOption | (ComboBoxOption & ModelFacets)
+
+function isModelItem(item: ComboBoxItem): item is ComboBoxOption & ModelFacets {
+  return 'types' in item
 }
 
 interface ComboBoxProps {
@@ -36,6 +46,9 @@ interface ComboBoxProps {
   supportedModels?: string[]
   hfToken?: string
   helperText?: React.ReactNode
+  label?: string
+  portalMenu?: boolean
+  preserveOrder?: boolean
 }
 
 interface GroupedItems {
@@ -43,16 +56,32 @@ interface GroupedItems {
   items: ComboBoxItem[]
 }
 
-function groupItems(items: ComboBoxItem[]): GroupedItems[] {
+function groupItems(items: ComboBoxItem[], preserveOrder: boolean): GroupedItems[] {
   const map = new Map<string, ComboBoxItem[]>()
   for (const item of items) {
     if (!map.has(item.group)) map.set(item.group, [])
     map.get(item.group)!.push(item)
   }
-  return Array.from(map, ([group, items]) => ({
+  return Array.from(map, ([group, groupItems]) => ({
     group,
-    items: items.toSorted((a, b) => a.label.localeCompare(b.label)),
+    items: preserveOrder ? groupItems : groupItems.toSorted((a, b) => a.label.localeCompare(b.label)),
   })).toSorted((a, b) => a.group.localeCompare(b.group))
+}
+
+/** Compact parameter count for a chip: 0.6B, 32B, 2.4T. Matches modelSizeLabel. */
+function paramsChip(paramsB: number | null): string | null {
+  if (paramsB === null) return null
+  if (paramsB >= 1_000) return `${Number((paramsB / 1_000).toFixed(2))}T`
+  if (paramsB >= 0.1) return `${Number(paramsB.toFixed(1))}B`
+  return `${Math.round(paramsB * 1_000)}M`
+}
+
+/** Compact context window for a chip: 128K, 1M. */
+function contextChip(contextLength: number | null): string | null {
+  if (!contextLength) return null
+  if (contextLength >= 1_048_576) return `${Number((contextLength / 1_048_576).toFixed(1))}M ctx`
+  if (contextLength >= 1_024) return `${Math.round(contextLength / 1_024)}K ctx`
+  return `${contextLength} ctx`
 }
 
 function suggestedNames(): string {
@@ -60,14 +89,51 @@ function suggestedNames(): string {
   return names.length > 0 ? names.join(', ') : 'Nemotron, DeepSeek V4, Gemma 4, Kimi'
 }
 
-export function ComboBox({ value, onChange, items, placeholder, id, allowCustom = false, supportedModels, hfToken, helperText }: ComboBoxProps) {
+function ProvenanceBadges({ item }: { item: ComboBoxItem }) {
+  if (item.isTested) return <span className={styles.testedBadge}>tested</span>
+  if (item.inCatalog) return <span className={styles.catalogBadge}>in catalog</span>
+  if (item.isHuggingFace) return <span className={styles.hfBadge}>hugging face</span>
+  return null
+}
+
+/**
+ * The metadata line under a row's label. Only facts that distinguish this
+ * model from its neighbours are shown — "text" is omitted because almost
+ * every row is text, and a chip on every row carries no information.
+ */
+function RowMeta({ item }: { item: ComboBoxItem }) {
+  if (!isModelItem(item)) return null
+  const chips: string[] = []
+
+  const params = paramsChip(item.paramsB)
+  if (params) {
+    chips.push(item.activeParamsB !== null
+      ? `${params} (${paramsChip(item.activeParamsB)} active)`
+      : params)
+  }
+  if (item.types.includes('vision')) chips.push('Vision')
+  if (item.types.includes('moe')) chips.push('MoE')
+
+  const context = contextChip(item.contextLength)
+  if (context) chips.push(context)
+
+  if (item.quantization) chips.push(item.quantization)
+
+  if (chips.length === 0) return null
+  return (
+    <div className={styles.optionMeta}>
+      {chips.map((chip, index) => <span key={index} className={styles.metaChip}>{chip}</span>)}
+    </div>
+  )
+}
+
+export function ComboBox({ value, onChange, items, placeholder, id, allowCustom = false, supportedModels, hfToken, helperText, label = 'Model — Hugging Face ID', portalMenu = false, preserveOrder = false }: ComboBoxProps) {
   const [open, setOpen] = React.useState(false)
   const [filter, setFilter] = React.useState('')
   const [supportedOnly, setSupportedOnly] = React.useState(false)
   const prevModel = React.useRef(value)
   const [focusIndex, setFocusIndex] = React.useState(-1)
   const textInputRef = React.useRef<HTMLInputElement>(null)
-  const toggleRef = React.useRef<HTMLDivElement>(null)
 
   const validatedItems = React.useMemo(() =>
     supportedModels ? items.filter(i => supportedModels.includes(i.value)) : items,
@@ -97,23 +163,32 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
 
   const selectedItem = activeItems.find(i => i.value === value)
 
+  const isSearching = filter.trim().length > 0
+  const modelSearch = activeItems.every(isModelItem)
   const filtered = React.useMemo(() => {
-    if (!filter) return activeItems
-    const q = filter.toLowerCase()
-    return activeItems.filter(i =>
-      i.label.toLowerCase().includes(q) ||
-      i.value.toLowerCase().includes(q) ||
-      i.group.toLowerCase().includes(q)
-    )
+    if (!filter.trim()) return activeItems
+    if (activeItems.every(isModelItem)) return searchModels(activeItems, filter)
+    const query = filter.trim().toLowerCase()
+    return activeItems.filter(item => [item.label, item.description, item.value, item.group]
+      .some(text => text?.toLowerCase().includes(query)))
   }, [activeItems, filter])
 
-  const groups = React.useMemo(() => groupItems(filtered), [filtered])
+  /**
+   * Browsing groups by vendor. Searching returns one relevance-ranked list —
+   * regrouping a ranked set would sort the best match back under "Q".
+   */
+  const groups = React.useMemo<GroupedItems[]>(
+    () => {
+      if (!isSearching || !modelSearch) return groupItems(filtered, preserveOrder)
+      // A single unlabelled group, and none at all when nothing matched, so
+      // the "No matches" row below still renders.
+      if (filtered.length === 0) return []
+      return [{ group: '', items: filtered }]
+    },
+    [filtered, isSearching, modelSearch, preserveOrder],
+  )
 
-  const flatItems = React.useMemo(() => {
-    const flat: ComboBoxItem[] = []
-    for (const g of groups) flat.push(...g.items)
-    return flat
-  }, [groups])
+  const flatItems = React.useMemo(() => groups.flatMap(g => g.items), [groups])
 
   const exactMatch = items.some(i => i.value.toLowerCase() === filter.toLowerCase() || i.label.toLowerCase() === filter.toLowerCase())
   const showCustom = allowCustom && open && filter.trim() && !exactMatch
@@ -202,7 +277,7 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
     <MenuToggle
       ref={tRef as React.RefObject<HTMLButtonElement>}
       variant="typeahead"
-      aria-label="Model selector"
+      aria-label={label}
       onClick={() => { setOpen(prev => !prev); if (!open) setFilter('') }}
       isExpanded={open}
       isFullWidth
@@ -211,14 +286,16 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
       <TextInputGroup isPlain>
         <TextInputGroupMain
           value={displayValue}
+          title={selectedItem?.label}
           onClick={() => { if (!open) { setOpen(true); setFilter('') } }}
           onChange={handleInputChange}
           onFocus={handleInputFocus}
           onKeyDown={handleInputKeyDown}
-          id={id}
+          inputId={id}
+          aria-label={label}
           autoComplete="off"
-          innerRef={textInputRef}
-          placeholder={placeholder ?? 'Type or select...'}
+          ref={textInputRef}
+          placeholder={placeholder ?? (modelSearch ? 'Search by name, size, type or precision...' : 'Type or select...')}
           role="combobox"
           isExpanded={open}
           aria-controls={id ? `${id}-listbox` : undefined}
@@ -227,9 +304,7 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
         <TextInputGroupUtilities>
           {value && !open && selectedItem && (
             <div className={styles.selectedBadges}>
-              {selectedItem.isTested && <span className={styles.testedBadge}>tested</span>}
-              {selectedItem.inCatalog && !selectedItem.isTested && <span className={styles.catalogBadge}>in catalog</span>}
-              {selectedItem.isHuggingFace && !selectedItem.isTested && !selectedItem.inCatalog && <span className={styles.hfBadge}>hugging face</span>}
+              <ProvenanceBadges item={selectedItem} />
             </div>
           )}
           {value && !open && (
@@ -245,7 +320,7 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
   return (
     <div className={styles.wrapper}>
       <div className={styles.labelRow}>
-        <label className={styles.label} htmlFor={id}>Model — Hugging Face ID</label>
+        <label className={styles.label} htmlFor={id}>{label}</label>
         {supportedModels && (
           <Switch
             id={id ? `${id}-validated-only` : 'validated-only'}
@@ -265,7 +340,7 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
         onOpenChange={isOpen => { setOpen(isOpen); if (!isOpen) { setFilter(''); setFocusIndex(-1) } }}
         toggle={toggle}
         shouldFocusFirstItemOnOpen={false}
-        popperProps={{ width: 'trigger', maxWidth: 'trigger' }}
+        popperProps={{ width: 'trigger', maxWidth: 'trigger', ...(portalMenu ? { appendTo: () => document.body } : {}) }}
       >
         <SelectList id={id ? `${id}-listbox` : undefined} className={styles.selectList}>
           {groups.length === 0 && !showCustom && (
@@ -287,13 +362,14 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
                   onMouseEnter={() => setFocusIndex(idx)}
                 >
                   <div className={styles.optionRow}>
-                    <span>{item.label}</span>
+                    <span className={`${styles.optionLabel} ${styles.optionText}`}>{item.label}
+                      {item.description && <span className={styles.optionDescription}>{item.description}</span>}
+                    </span>
                     <div className={styles.badges}>
-                      {item.isTested && <span className={styles.testedBadge}>tested</span>}
-                      {item.inCatalog && !item.isTested && <span className={styles.catalogBadge}>in catalog</span>}
-                      {item.isHuggingFace && !item.isTested && !item.inCatalog && <span className={styles.hfBadge}>hugging face</span>}
+                      <ProvenanceBadges item={item} />
                     </div>
                   </div>
+                  <RowMeta item={item} />
                 </SelectOption>
               )
             })
@@ -330,7 +406,7 @@ export function ComboBox({ value, onChange, items, placeholder, id, allowCustom 
               <span>Tested: {suggestedNames()}, ... — type to autocomplete</span>
             ) : (
               <>
-                <div>Tested: {suggestedNames()}, ... — type to autocomplete</div>
+                <div>Tested: {suggestedNames()}, ... — search by size (&ldquo;70b&rdquo;), type (&ldquo;vision&rdquo;, &ldquo;moe&rdquo;) or precision (&ldquo;fp8&rdquo;)</div>
                 {value && !supportedModels.includes(value) && getAppConfig().modelRequestUrl && (
                   <div>New model? <a href={getAppConfig().modelRequestUrl + encodeURIComponent(value)} target="_blank" rel="noopener" className={styles.requestLink}>Request testing →</a></div>
                 )}

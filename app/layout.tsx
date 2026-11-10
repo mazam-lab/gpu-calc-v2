@@ -43,6 +43,7 @@ import { AppShell } from "@/components/layout/AppShell";
 import { RecommendProvider } from "@/contexts/RecommendContext";
 import { KvCacheProvider } from "@/contexts/KvCacheContext";
 import { SettingsProvider } from "@/contexts/SettingsContext";
+import { CostAssumptionsProvider } from "@/contexts/CostAssumptionsContext";
 
 const redHatDisplay = Red_Hat_Display({
   subsets: ["latin"],
@@ -77,11 +78,11 @@ export default function RootLayout({
     <html lang="en">
       <body className={`${redHatDisplay.variable} ${redHatText.variable} ${redHatMono.variable}`}>
         <RecommendProvider>
-          <KvCacheProvider>
-            <SettingsProvider>
+          <SettingsProvider>
+            <CostAssumptionsProvider>
               <AppShell>{children}</AppShell>
-            </SettingsProvider>
-          </KvCacheProvider>
+            </CostAssumptionsProvider>
+          </SettingsProvider>
         </RecommendProvider>
       </body>
     </html>

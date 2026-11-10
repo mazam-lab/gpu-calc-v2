@@ -9,6 +9,7 @@ See docs/api/openapi.yaml for the full spec.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -16,6 +17,9 @@ import os
 import re
 import sys
 import tempfile
+import threading
+from collections import Counter, OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -31,8 +35,18 @@ from aisimulate_core.sdk.backends.factory import get_backend
 from aisimulate_core.sdk.common import get_default_models
 from aisimulate_core.sdk.errors import NoFeasibleConfigError
 from aisimulate_core.sdk.memory import estimate_kv_cache
-from aisimulate_core.sdk.perf_database import get_supported_databases, load_system_spec
+from aisimulate_core.sdk.perf_database import get_supported_databases, get_version_slots, load_system_spec
 from aisimulate_core.sdk.utils import get_model_config_from_model_path
+
+from .blis.manifest import BlisManifestError, BlisUnsupportedRequest, load_support_manifest
+from .blis.runner import BlisExecutionError, BlisTimeoutError
+from .blis.runtime import blis_release
+from .blis.scenario import DEFAULT_ENGINE_VERSION, ENGINE_VERSION_SUPPORT, MODELED_ENGINE_VERSIONS
+from .blis.service import EstimateInput as BlisEstimateInput
+from .blis.service import RecommendInput as BlisRecommendInput
+from .blis.service import estimate as run_blis_estimate
+from .blis.service import recommend as run_blis_recommend
+from .blis.service import supported_model_ids, supported_system_ids
 
 # Optional observability + MCP, provided by the shared configiq package
 # (configiq[otel,mcp]). Kept out of the base install/container because otel
@@ -59,7 +73,18 @@ class RecommendRequest(BaseModel):
     model_path: str = Field(examples=["Qwen/Qwen3-32B"], description="HuggingFace model path or SDK model key.")
     system: str = Field(examples=["h200_sxm"], description="GPU system identifier.")
     backend: str = Field(default="vllm", description="Inference backend.")
-    backend_version: str | None = Field(default=None, examples=[None], description="Backend version.")
+    backend_version: str | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Backend version. Omit (or send `current`) to resolve the system "
+            "default published in /backends system_defaults and let the service "
+            "retry newer versions when the default has no performance data for "
+            "this model. Literal versions, `previous`, and `next` are pins and are "
+            "never substituted; if the data cannot serve them the request returns "
+            "422 naming the versions the SDK ships."
+        ),
+    )
     target_request_rate: float | None = Field(default=None, examples=[None], description="Target req/s.")
     target_concurrency: float | None = Field(default=None, examples=[32], description="Target concurrent users.")
     isl: int = Field(default=4000, description="Input sequence length.")
@@ -73,6 +98,12 @@ class RecommendRequest(BaseModel):
     prefix: int = Field(default=0, description="Prefix cache length.")
     database_mode: str = Field(default="HYBRID", description="Perf database mode.")
     top_n: int = Field(default=5, ge=1, le=20, examples=[2], description="Number of configs to return.")
+    search_budget_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=60,
+        description="BLIS total search budget in seconds. Capped to keep the search within gateway timeouts.",
+    )
     min_candidate_gpus: int | None = Field(default=None, gt=0, description="Lower bound for the recommendation GPU window.")
     max_candidate_gpus: int | None = Field(default=None, gt=0, description="Upper bound for the recommendation GPU window.")
     inclusive_tpot: bool = Field(
@@ -87,8 +118,13 @@ class RecommendRequest(BaseModel):
         description="Pre-fetched HuggingFace model config.json. Skips HF download. "
         "Leave null to let the service resolve the model from HuggingFace.",
     )
-
+    fabric: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Inter-node fabric for P/D candidates. BLIS defaults to roce-200g; explicit null searches aggregate candidates only. AISimulate does not consume this field.",
+    )
     model_config = {"populate_by_name": True}
+    simulator: Literal["aisimulate", "blis"] = Field(default="aisimulate", description="Simulator to use.")
 
     @model_validator(mode="after")
     def exactly_one_load_target(self):
@@ -102,6 +138,10 @@ class RecommendRequest(BaseModel):
             and self.min_candidate_gpus > self.max_candidate_gpus
         ):
             raise ValueError("min_candidate_gpus cannot exceed max_candidate_gpus.")
+        if self.simulator == "aisimulate" and self.fabric is not None:
+            raise ValueError("AISimulate does not currently consume a network-fabric selection")
+        if self.simulator == "blis" and "fabric" not in self.model_fields_set:
+            self.fabric = "roce-200g"
         return self
 
 
@@ -109,7 +149,18 @@ class EstimateRequest(BaseModel):
     model_path: str = Field(examples=["Qwen/Qwen3-32B"], description="HuggingFace model path or SDK model key.")
     system: str = Field(examples=["h200_sxm"], description="GPU system identifier.")
     backend: str = Field(default="vllm", description="Inference backend.")
-    backend_version: str | None = Field(default=None, examples=[None], description="Backend version.")
+    backend_version: str | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Backend version. Omit (or send `current`) to resolve the system "
+            "default published in /backends system_defaults and let the service "
+            "retry newer versions when the default has no performance data for "
+            "this model. Literal versions, `previous`, and `next` are pins and are "
+            "never substituted; if the data cannot serve them the request returns "
+            "422 naming the versions the SDK ships."
+        ),
+    )
     isl: int = Field(default=4000, description="Input sequence length.")
     osl: int = Field(default=1000, description="Output sequence length.")
     max_seq_len: int | None = Field(default=None, gt=0, description="Maximum sequence length for KV cache allocation.")
@@ -125,6 +176,12 @@ class EstimateRequest(BaseModel):
     tp_size: int = Field(default=1, description="Tensor parallel size.")
     pp_size: int = Field(default=1, description="Pipeline parallel size.")
     batch_size: int = Field(default=128, description="Batch size (max concurrent requests).")
+    requests_per_load_unit: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Optional simulated requests per concurrency slot. When omitted, stop after one total request.",
+    )
     database_mode: str = Field(default="HYBRID", description="Perf database mode.")
     gemm_quant_mode: str | None = Field(default=None)
     moe_quant_mode: str | None = Field(default=None)
@@ -162,8 +219,20 @@ class EstimateRequest(BaseModel):
         description="Pre-fetched HuggingFace model config.json. Skips HF download. "
         "Leave null to let the service resolve the model from HuggingFace.",
     )
+    fabric: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Inter-node fabric for P/D transfer. BLIS uses this field; AISimulate does not consume it.",
+    )
 
     model_config = {"populate_by_name": True}
+    simulator: Literal["aisimulate", "blis"] = Field(default="aisimulate", description="Simulator to use.")
+
+    @model_validator(mode="after")
+    def reject_aisimulate_fabric(self):
+        if self.simulator == "aisimulate" and self.fabric is not None:
+            raise ValueError("AISimulate does not currently consume a network-fabric selection")
+        return self
 
 
 class MemoryBreakdown(BaseModel):
@@ -179,8 +248,9 @@ class ServingConfig(BaseModel):
     tensor_parallel_size: int
     max_model_len: int
     max_num_seqs: int
+    max_num_batched_tokens: int | None = None
     gpu_memory_utilization: float
-    enable_chunked_prefill: bool
+    enable_chunked_prefill: bool | None
     enable_prefix_caching: bool
     quantization: str
     memory_fraction: float | None = None
@@ -206,6 +276,17 @@ class WorkerConfig(BaseModel):
     comm: str | None = None
     backend_version: str | None = None
     memory_breakdown: MemoryBreakdown | None = None
+
+
+class SimulatorProvenance(BaseModel):
+    simulator: Literal["aisimulate", "blis"]
+    requested_model: str | None = None
+    resolved_model: str | None = None
+    model_source: str | None = None
+    system: str | None = None
+    hardware: str | None = None
+    model_config_relation: str | None = None
+    engine_version: str | None = None
 
 
 class RecommendConfig(BaseModel):
@@ -246,11 +327,16 @@ class RecommendConfig(BaseModel):
     prefill_config: WorkerConfig | None = None
     decode_config: WorkerConfig | None = None
     mode: str = "agg"
+    simulator: Literal["aisimulate", "blis"] = "aisimulate"
+    provenance: SimulatorProvenance | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RecommendResponse(BaseModel):
     configs: list[RecommendConfig]
     chosen_mode: str
+    simulator: Literal["aisimulate", "blis"] = "aisimulate"
+    search_summary: dict[str, Any] | None = None
 
 
 class EstimateResponse(BaseModel):
@@ -278,6 +364,10 @@ class EstimateResponse(BaseModel):
     mode: str = "agg"
     prefill_config: WorkerConfig | None = None
     decode_config: WorkerConfig | None = None
+    simulator: Literal["aisimulate", "blis"] = "aisimulate"
+    provenance: SimulatorProvenance | None = None
+    memory_unavailable_reason: str | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class MemoryRequest(BaseModel):
@@ -319,6 +409,17 @@ class MemoryResponse(BaseModel):
     source: str
     memory_breakdown: MemoryBreakdown
     tolerance_adjusted: dict[str, Any] | None = None
+    simulator: Literal["aisimulate", "blis"] = "aisimulate"
+
+
+class _PredictionResult:
+    """Small adapter around the SDK metrics consumed by ``post_predict``."""
+
+    def __init__(self, summary: dict[str, Any]):
+        self.summary = summary
+        self.provenance: dict[str, Any] | None = None
+        self.serving_config: dict[str, Any] | None = None
+        self.warnings: list[str] = []
 
 
 class SystemDetail(BaseModel):
@@ -392,6 +493,48 @@ def _backend_runtime_memory_field(backend: str) -> str:
 
 def _version_sort_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def _current_or_newest(slots: dict[str, str] | None, versions: list[str]) -> str | None:
+    """The version a system completed, not the newest one anyone declared.
+
+    Slots are absent when the SDK ships no version gate, where the newest
+    declared version is the best available answer.
+    """
+    if slots and slots.get("current"):
+        return slots["current"]
+    return max(versions, key=_version_sort_key) if versions else None
+
+
+def _declared_versions(system: str, backend: str) -> list[str]:
+    """Literal backend versions declared for a system, oldest first.
+
+    Mirrors the per-system list ``/backends`` publishes, so a fallback can
+    never offer a version the SDK does not ship data for.
+    """
+    try:
+        supported = get_supported_databases().get(system, {})
+    except Exception:
+        logger.warning("Could not read the supported databases for %s", system, exc_info=True)
+        return []
+    return sorted(supported.get(_sdk_backend_id(backend), []) or [], key=_version_sort_key)
+
+
+def _system_default_version(system: str, backend: str) -> str | None:
+    """The literal version an omitted ``backend_version`` resolves to.
+
+    ``/backends`` documents this as ``system_defaults[system]``. Resolving it
+    here with the same rule lets a prediction report the version it actually
+    used instead of echoing the caller's blank.
+    """
+    versions = _declared_versions(system, backend)
+    if not versions:
+        return None
+    try:
+        slots = get_version_slots(system, _sdk_backend_id(backend))
+    except Exception:
+        slots = None
+    return _current_or_newest(slots, versions)
 
 
 class _noop_context:
@@ -629,7 +772,11 @@ def _aisimulate_prediction_config(req: EstimateRequest) -> dict[str, Any]:
                 "cached_prefix_tokens": req.prefix,
             },
             "load": {"type": "concurrency", "concurrency": req.batch_size},
-            "stop": {"requests": 1},
+            "stop": (
+                {"requests": 1}
+                if req.requests_per_load_unit is None
+                else {"requests_per_load_unit": req.requests_per_load_unit}
+            ),
         },
         "engine": {
             "mode": mode,
@@ -700,6 +847,27 @@ def _per_user_throughput(metrics: dict[str, Any], concurrency: int | None) -> fl
     if throughput is None or not concurrency or concurrency <= 0:
         return None
     return throughput / concurrency
+
+
+def _prediction_total_gpus(summary: dict[str, Any], req: EstimateRequest) -> int | None:
+    reported = _coerce_int(summary.get("num_total_gpus"))
+    if reported is not None and reported > 0:
+        return reported
+    if req.mode == "agg":
+        return req.tp_size * req.pp_size * req.attention_dp_size
+    prefill_gpus = (
+        (req.prefill_tp_size or req.tp_size)
+        * (req.prefill_pp_size or req.pp_size)
+        * req.attention_dp_size
+        * (req.prefill_num_workers or 1)
+    )
+    decode_gpus = (
+        (req.decode_tp_size or req.tp_size)
+        * (req.decode_pp_size or req.pp_size)
+        * req.attention_dp_size
+        * (req.decode_num_workers or 1)
+    )
+    return prefill_gpus + decode_gpus
 
 
 def _aisimulate_worker_config(raw: dict[str, Any], role: str, req: RecommendRequest) -> WorkerConfig | None:
@@ -777,20 +945,160 @@ def _run_aisimulate_recommendation(req: RecommendRequest):
         )
 
 def _run_aisimulate_prediction(req: EstimateRequest, include: set[str]):
-    from aisimulate.predict import run_prediction
+    from aisimulate.compiler import prediction_to_replay_spec
+    from aisimulate.config.cli import CorePredictionConfig
     from aisimulate.sweeper.replay import ReplayOutputRequirements
 
     with _with_model_config(req.model_path, req.model_config_data) as effective_path:
         prediction_req = req.model_copy(update={"model_path": effective_path})
-        return run_prediction(
-            _aisimulate_prediction_config(prediction_req),
-            stack="engine",
-            runner_factory=_aisimulate_runner_factory(),
+        config = CorePredictionConfig.model_validate(
+            _aisimulate_prediction_config(prediction_req)
+        )
+        spec = prediction_to_replay_spec(config)
+        runner = _aisimulate_runner_factory().create(worker_id=0)
+        report = runner.run(
+            spec,
             output_requirements=ReplayOutputRequirements(
                 include_raw_report=True,
                 capture_memory_diagnostics="memory" in include,
             ),
         )
+        return _PredictionResult(dict(report.metrics))
+
+
+#: One cached fallback per request shape, so a blank-version request pays the
+#: failed attempt once instead of on every call. The shape is part of the key:
+#: a version can cover one shape and miss another, and a cached fallback must
+#: not skip a default that works for a different request. Least-recently-used
+#: entries are evicted so sustained traffic cannot grow it without bound.
+#: Synchronous handlers run in a threadpool, so cache access is locked.
+_VERSION_FALLBACK_CACHE_LOCK = threading.Lock()
+_VERSION_FALLBACK_CACHE: OrderedDict[tuple[str, str, str, str, str], str] = OrderedDict()
+_VERSION_FALLBACK_CACHE_MAX = 512
+
+#: Bound the extra replay work: the system default plus the two newest versions.
+_VERSION_FALLBACK_ATTEMPTS = 3
+
+#: The SDK slot alias that means "the system default" (see
+#: ``resolve_query_version``). ``previous`` and ``next`` name specific slots.
+_DEFAULT_VERSION_ALIAS = "current"
+
+
+def _clear_version_fallback_cache() -> None:
+    """Drop the resolved-version cache (used by tests and after data reloads)."""
+    with _VERSION_FALLBACK_CACHE_LOCK:
+        _VERSION_FALLBACK_CACHE.clear()
+
+
+def _fallback_cache_key(req: Any, default: str | None) -> tuple[str, str, str, str, str]:
+    """Model, system, backend, resolved default, and the request shape.
+
+    Coverage gaps depend on the compute shape, so keying on the model alone
+    would let a fallback for one workload skip the default for another. The
+    resolved default is part of the key too: when the SDK moves its ``current``
+    slot, a cached fallback must not bypass the new default. The shape is
+    hashed so a large ``model_config`` does not stay resident.
+    """
+    shape = req.model_dump(mode="json", exclude={"backend_version"})
+    digest = hashlib.sha256(
+        json.dumps(shape, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+    return (req.model_path, req.system, _sdk_backend_id(req.backend), default or "", digest)
+
+
+def _fallback_cache_get(cache_key: tuple[str, str, str, str, str]) -> str | None:
+    """Read a cached fallback and mark it most recently used."""
+    with _VERSION_FALLBACK_CACHE_LOCK:
+        cached = _VERSION_FALLBACK_CACHE.get(cache_key)
+        if cached is not None:
+            _VERSION_FALLBACK_CACHE.move_to_end(cache_key)
+        return cached
+
+
+def _fallback_cache_put(cache_key: tuple[str, str, str, str, str], version: str) -> bool:
+    """Store a resolved fallback, evicting least-recently-used entries.
+
+    Returns whether this was a new entry, so the caller logs each model once
+    rather than on every request that hits the cache.
+    """
+    with _VERSION_FALLBACK_CACHE_LOCK:
+        is_new = cache_key not in _VERSION_FALLBACK_CACHE
+        _VERSION_FALLBACK_CACHE[cache_key] = version
+        _VERSION_FALLBACK_CACHE.move_to_end(cache_key)
+        while len(_VERSION_FALLBACK_CACHE) > _VERSION_FALLBACK_CACHE_MAX:
+            _VERSION_FALLBACK_CACHE.popitem(last=False)
+        return is_new
+
+
+def _run_with_version_fallback(req: Any, run: Callable[[], Any]) -> tuple[Any, str | None]:
+    """Resolve an omitted ``backend_version`` to a version that can serve the model.
+
+    A blank version (or the ``current`` alias, which means the same thing) is
+    resolved to a literal version. The system default is right for most models,
+    but a model can be missing from that version's op-level data while a newer
+    version covers it (dense Gemma-4 31B is absent on vLLM 0.24.0 and present on
+    0.31.0). Retry only on a performance-data gap, and never for a version the
+    caller pinned literally: ``previous`` and ``next`` name specific slots.
+
+    Returns ``(result, version_the_default_could_not_serve)``.
+    """
+    requested = (req.backend_version or "").strip() or None
+    # ``current`` is an alias for the system default, not a pin on a literal
+    # version; ``previous`` and ``next`` name specific slots and are honoured.
+    open_version = requested is None or requested == _DEFAULT_VERSION_ALIAS
+    if not open_version:
+        try:
+            return run(), None
+        except Exception as error:
+            if _is_perf_data_gap(error):
+                raise _PerfDataGap(
+                    model=req.model_path,
+                    system=req.system,
+                    backend=req.backend,
+                    requested_version=requested,
+                    attempted=[requested],
+                    cause=error,
+                ) from error
+            raise
+
+    declared = _declared_versions(req.system, req.backend)
+    default = _system_default_version(req.system, req.backend)
+    cache_key = _fallback_cache_key(req, default)
+    # Ignore a cached fallback that a data update no longer declares: replaying
+    # it would fail as an unlisted version instead of finding coverage again.
+    cached = _fallback_cache_get(cache_key)
+    first = cached if cached in declared else default
+    ordered = [first] + [version for version in reversed(declared) if version != first]
+
+    attempted: list[str | None] = []
+    cause: BaseException | None = None
+    for version in ordered[:_VERSION_FALLBACK_ATTEMPTS]:
+        req.backend_version = version
+        attempted.append(version)
+        try:
+            result = run()
+        except Exception as error:
+            if not _is_perf_data_gap(error):
+                raise
+            cause = error
+            continue
+        if version and default and version != default:
+            if _fallback_cache_put(cache_key, version):
+                logger.warning(
+                    "No performance data for %s with %s %s on %s; resolved to %s",
+                    req.model_path, req.backend, default, req.system, version,
+                )
+            return result, default
+        return result, None
+
+    raise _PerfDataGap(
+        model=req.model_path,
+        system=req.system,
+        backend=req.backend,
+        requested_version=None,
+        attempted=attempted,
+        cause=cause or RuntimeError("no performance data for this model"),
+    )
 
 
 def _worker_config_from_row(row: pd.Series, prefix: str, req: RecommendRequest) -> WorkerConfig | None:
@@ -956,8 +1264,117 @@ def _memory_breakdown_gb(breakdown: MemoryBreakdown | None) -> float | None:
     return total_bytes / (1024 ** 3)
 
 
+#: Version rejections the engine runner wraps as RuntimeError("ValueError: ..."),
+#: so they arrive by text rather than by exception type.
+_UNSERVABLE_MESSAGE = re.compile(
+    r"is not a queryable version|no queryable versions defined|no timing data for"
+)
+
+#: A replay that reaches a compute shape the selected performance data never
+#: measured. The runner wraps these in "AISimulate replay failed: engine error:
+#: ...", so they are matched by text (and by exception type) rather than class.
+#: This is a coverage gap for this model/version, not a service failure: a 500
+#: told users the API was down when another backend_version would have worked.
+_PERF_DATA_GAP_MESSAGE = re.compile(
+    r"EmpiricalNotImplementedError"
+    r"|empirical estimation not implemented"
+    r"|No empirical utilisation data"
+    r"|no own-shape, cross-shape, or sibling transfer reference"
+    r"|perf database error: (?:data missing|data empty|data unavailable|no rows in"
+    r"|has no compatible data|has data for|no data to anchor)",
+    re.IGNORECASE,
+)
+
+_PERF_DATA_GAP_TYPES = frozenset({"EmpiricalNotImplementedError", "PerfDataNotAvailableError"})
+
+#: The op query the estimator could not price, e.g. ``[32.0, 2048.0, 1.0]``.
+_SHAPE_QUERY = re.compile(r"at query=\[([^\]]*)\]")
+
+
+def _exception_chain_text(error: BaseException) -> str:
+    """Every message in an exception's cause chain, innermost text included."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(parts) < 6:
+        seen.add(id(current))
+        parts.append(str(current))
+        current = current.__cause__ or current.__context__
+    return " | ".join(parts)
+
+
+def _is_perf_data_gap(error: BaseException) -> bool:
+    """Whether an error means "this data set has no measurement", not "we broke"."""
+    if error.__class__.__name__ in _PERF_DATA_GAP_TYPES:
+        return True
+    return bool(_PERF_DATA_GAP_MESSAGE.search(_exception_chain_text(error)))
+
+
+def _perf_gap_shape(error: BaseException) -> str:
+    """Name the missing coverage in the estimator's own terms, without the noise."""
+    text = _exception_chain_text(error)
+    match = _SHAPE_QUERY.search(text)
+    if match is not None:
+        shape = ", ".join(
+            part.strip().removesuffix(".0") or part.strip()
+            for part in match.group(1).split(",")
+        )
+        return f"no measurement for compute shape [{shape}]"
+    if "no own-shape, cross-shape, or sibling transfer reference" in text:
+        return "no measurement, and no transferable reference shape"
+    return "no measurement for a compute shape this model needs"
+
+
+class _PerfDataGap(Exception):
+    """No empirical performance data for this model on the selected backend."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        system: str,
+        backend: str,
+        requested_version: str | None,
+        attempted: list[str | None],
+        cause: BaseException,
+    ) -> None:
+        self.model = model
+        self.system = system
+        self.backend = backend
+        self.requested_version = requested_version
+        self.attempted = attempted
+        self.cause = cause
+        super().__init__(self.detail())
+
+    def detail(self) -> str:
+        shape = _perf_gap_shape(self.cause)
+        declared = _declared_versions(self.system, self.backend)
+        listed = ", ".join(declared) if declared else "none"
+        if self.requested_version:
+            return (
+                f"No empirical performance data for model={self.model} with "
+                f"{self.backend} {self.requested_version} on {self.system}: {shape}. "
+                f"Versions the SDK ships for {self.system}: {listed}. Retry with one of "
+                "those, or omit backend_version to let the service choose."
+            )
+        tried = ", ".join(version or "the system default" for version in self.attempted)
+        return (
+            f"No empirical performance data for model={self.model} with {self.backend} on "
+            f"{self.system}: {shape}. Tried {tried or 'the system default'}. The estimator "
+            "has no coverage for this model on this system; try another backend or GPU system."
+        )
+
+
+def _unwrapped_detail(msg: str) -> str:
+    return re.sub(r"^[A-Za-z_][A-Za-z0-9_]*Error: ", "", msg, count=1)
+
+
 def _common_error_handler(e: Exception, op: str, model_path: str, backend: str, system: str) -> None:
     msg = str(e)
+    # A pinned version that the performance data cannot serve, or a blank
+    # version that no declared version can serve. Both are client-actionable.
+    if isinstance(e, _PerfDataGap):
+        raise HTTPException(status_code=422, detail=e.detail())
     # aisimulate's recommendation stack uses NoViableParallelConfig when a
     # bounded GPU window is too small to hold the model. That is an expected
     # no-result response (the caller may try a larger window), not a server
@@ -970,6 +1387,28 @@ def _common_error_handler(e: Exception, op: str, model_path: str, backend: str, 
     # infeasible and must not terminate an incremental search.
     if "NoViableParallelConfig" in msg or "no deployment_mode has a viable parallel config" in msg:
         raise HTTPException(status_code=422, detail=msg)
+    # The engine runner reports the same two rejections as RuntimeError
+    # ("ValueError: ..."), so they are matched by text as well as by type.
+    if _UNSERVABLE_MESSAGE.search(msg):
+        raise HTTPException(status_code=422, detail=_unwrapped_detail(msg))
+    # Defence for call sites that do not run the version-fallback wrapper
+    # (/memory, legacy callers). Predict and recommend raise _PerfDataGap,
+    # which carries the versions already tried.
+    if _is_perf_data_gap(e):
+        declared = _declared_versions(system, backend)
+        listed = (
+            f" Versions the SDK ships for {system}: {', '.join(declared)}."
+            if declared
+            else ""
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No empirical performance data for model={model_path} with {backend} "
+                f"on {system}: {_perf_gap_shape(e)}.{listed} Try another backend_version, "
+                "backend or GPU system."
+            ),
+        )
     if isinstance(e, KeyError):
         # A bare KeyError here almost always means a supplied model_config is
         # incomplete (e.g. missing 'architectures'); str(KeyError('x')) is "'x'".
@@ -1032,9 +1471,53 @@ app.add_middleware(
 )
 
 
+def _blis_backends() -> dict[str, Any]:
+    """BLIS backend/version support, in the same shape as the AISimulate branch.
+
+    BLIS versions are properties of the BLIS release, not of a GPU system, and BLIS
+    takes no version-scoped memory fraction from the SDK. ``systems`` and
+    ``system_defaults`` are therefore empty rather than filled with invented
+    per-system rows; ``version_support`` is the extra field that lets a client
+    disable a topology the selected release cannot model.
+    ``disaggregation_requires_fabric`` tells a client whether a P/D topology
+    needs an inter-node fabric it must collect from the user first.
+    """
+    return {
+        "simulator": "blis",
+        "blis_version": blis_release(),
+        "backends": [
+            {
+                "id": "vllm",
+                "aisimulate_id": "vllm",
+                "versions": list(MODELED_ENGINE_VERSIONS),
+                # A literal, not AISimulate's `current` alias: BLIS refuses aliases.
+                "default_version": DEFAULT_ENGINE_VERSION,
+                "memory_fraction": None,
+                "memory_fraction_kind": "of_total",
+                "runtime_field": "gpu_memory_utilization",
+                "systems": {},
+                "system_defaults": {},
+                # A P/D run transfers KV between pools, and BLIS prices that
+                # transfer through a named fabric, so the request must choose one.
+                "disaggregation_requires_fabric": True,
+                "version_support": {
+                    version: dict(support) for version, support in ENGINE_VERSION_SUPPORT.items()
+                },
+            }
+        ],
+    }
+
+
 @app.get("/backends")
-def get_backends():
+def get_backends(
+    simulator: Literal["aisimulate", "blis"] = Query(
+        default="aisimulate",
+        description="Simulator whose backend and version support is reported.",
+    ),
+):
     """Return backend/version support and effective memory defaults."""
+    if simulator == "blis":
+        return _blis_backends()
     supported = get_supported_databases()
     backend_data: dict[str, dict[str, Any]] = {}
     for system, systems_backends in supported.items():
@@ -1053,12 +1536,33 @@ def get_backends():
     for public_id, entry in sorted(backend_data.items()):
         backend = get_backend(entry["aisimulate_id"])
         versions = sorted(entry["versions"], key=_version_sort_key)
+        system_defaults: dict[str, str | None] = {}
+        gate_enabled = bool(entry["systems"])
+        any_gate_enabled = False
+        for system, system_versions in sorted(entry["systems"].items()):
+            slots = get_version_slots(system, entry["aisimulate_id"])
+            has_slots = bool(slots)
+            gate_enabled = gate_enabled and has_slots
+            any_gate_enabled = any_gate_enabled or has_slots
+            system_defaults[system] = _current_or_newest(slots, system_versions)
+        # Fleet-wide defaults describe the version most systems run, so a single
+        # backend-level figure does not silently advertise a version that only
+        # one override system declares.
+        counts = Counter(version for version in system_defaults.values() if version)
+        fleet_version = max(
+            counts.items(), key=lambda item: (item[1], _version_sort_key(item[0]))
+        )[0] if counts else None
         result.append({
             "id": public_id,
             "aisimulate_id": entry["aisimulate_id"],
             "versions": versions,
-            "default_version": versions[-1] if versions else None,
-            "memory_fraction": backend.get_default_free_gpu_memory_fraction(versions[-1] if versions else None),
+            # The alias resolves per system, so it is safe only when every
+            # system has slots. Mixed backends use the fleet fallback; with no
+            # gate anywhere, retain the newest declared version.
+            "default_version": "current" if gate_enabled else (
+                fleet_version if any_gate_enabled else (versions[-1] if versions else None)
+            ),
+            "memory_fraction": backend.get_default_free_gpu_memory_fraction(fleet_version),
             "memory_fraction_kind": "of_free" if backend.memory_fraction_of_free() else "of_total",
             "runtime_field": {
                 "vllm": "gpu_memory_utilization",
@@ -1066,15 +1570,17 @@ def get_backends():
                 "trtllm": "free_gpu_memory_fraction",
             }.get(entry["aisimulate_id"]),
             "systems": entry["systems"],
+            "system_defaults": {
+                system: {
+                    "version": version,
+                    "memory_fraction": backend.get_default_free_gpu_memory_fraction(version),
+                }
+                for system, version in system_defaults.items()
+            },
+            # AISimulate's P/D search takes no fabric; no extra input is needed.
+            "disaggregation_requires_fabric": False,
         })
-    return {"backends": result}
-
-# Expose the API as MCP tools if the optional extra is present.
-if _MCP:
-    mcp_support.mount(app, name="aisimulators",
-                      description="GPU recommendation and performance estimation for LLM inference")
-else:
-    logger.info("MCP server unavailable (install with: pip install '.[mcp]')")
+    return {"simulator": "aisimulate", "backends": result}
 
 
 @app.on_event("startup")
@@ -1106,8 +1612,26 @@ def post_recommend(
     include: str | None = Query(default=None, examples=["config,memory"], description="Comma-separated extras: config, memory."),
 ):
     """Find optimal GPU configuration for a workload."""
+    if req.simulator == "blis":
+        try:
+            outcome = _blis_recommend(req)
+        except (BlisUnsupportedRequest, BlisManifestError, BlisExecutionError) as e:
+            _handle_blis_error(e)
+        except Exception as e:
+            _common_error_handler(e, "recommend", req.model_path, req.backend, req.system)
+        if not outcome.configs:
+            raise HTTPException(status_code=422, detail="No configuration meets the specified requirements.")
+        return RecommendResponse(
+            configs=[RecommendConfig.model_validate(config) for config in outcome.configs],
+            chosen_mode=str(outcome.configs[0].get("mode", "agg")),
+            simulator="blis",
+            search_summary=outcome.search_summary,
+        )
+
     try:
-        result = _run_aisimulate_recommendation(req)
+        result, fell_back_from = _run_with_version_fallback(
+            req, lambda: _run_aisimulate_recommendation(req)
+        )
     except Exception as e:
         _common_error_handler(e, "recommend", req.model_path, req.backend, req.system)
 
@@ -1117,6 +1641,13 @@ def post_recommend(
 
     includes = _parse_include(include)
     configs = [_aisimulate_candidate_config(candidate, req) for candidate in candidates]
+    if fell_back_from and req.backend_version:
+        fallback_warning = (
+            f"No performance data for {req.backend} {fell_back_from} on {req.system}; "
+            f"used {req.backend_version}."
+        )
+        for cfg in configs:
+            cfg.warnings.insert(0, fallback_warning)
     for cfg in configs:
         if req.inclusive_tpot:
             cfg.tpot = _inclusive_tpot(cfg.ttft, cfg.tpot, req.osl)
@@ -1158,8 +1689,129 @@ def post_recommend(
                 if cfg.memory is None:
                     cfg.memory = _memory_breakdown_gb(cfg.memory_breakdown)
     chosen_mode = "disagg" if configs[0].prefill_config is not None else "agg"
-    return RecommendResponse(configs=configs, chosen_mode=chosen_mode)
+    return RecommendResponse(configs=configs, chosen_mode=chosen_mode, simulator="aisimulate")
 
+
+
+def _handle_blis_error(error: Exception) -> None:
+    if isinstance(error, BlisUnsupportedRequest):
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if isinstance(error, BlisManifestError):
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    if isinstance(error, BlisTimeoutError):
+        raise HTTPException(status_code=504, detail=str(error)) from error
+    if isinstance(error, BlisExecutionError):
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    raise error
+
+
+def _blis_estimate(req: EstimateRequest):
+    unsupported_values: dict[str, Any] = {
+        "database_mode": req.database_mode if req.database_mode != "HYBRID" else None,
+        "requests_per_load_unit": req.requests_per_load_unit,
+    }
+    if req.mode != "disagg":
+        unsupported_values.update({
+            "decode_system": req.decode_system,
+            "fabric": req.fabric,
+            "prefill_max_seq_len": req.prefill_max_seq_len,
+            "decode_max_seq_len": req.decode_max_seq_len,
+            "prefill_gpu_memory_utilization": req.prefill_gpu_memory_utilization,
+            "decode_gpu_memory_utilization": req.decode_gpu_memory_utilization,
+            "prefill_tp_size": req.prefill_tp_size,
+            "prefill_pp_size": req.prefill_pp_size,
+            "prefill_moe_tp_size": req.prefill_moe_tp_size,
+            "prefill_moe_ep_size": req.prefill_moe_ep_size,
+            "prefill_batch_size": req.prefill_batch_size,
+            "prefill_num_workers": req.prefill_num_workers,
+            "decode_tp_size": req.decode_tp_size,
+            "decode_pp_size": req.decode_pp_size,
+            "decode_moe_tp_size": req.decode_moe_tp_size,
+            "decode_moe_ep_size": req.decode_moe_ep_size,
+            "decode_batch_size": req.decode_batch_size,
+            "decode_num_workers": req.decode_num_workers,
+        })
+    unsupported_options = tuple(
+        name
+        for name, value in unsupported_values.items()
+        if value is not None
+    )
+    return run_blis_estimate(BlisEstimateInput(
+        model_path=req.model_path,
+        system=req.system,
+        backend=req.backend,
+        backend_version=req.backend_version,
+        isl=req.isl,
+        osl=req.osl,
+        concurrency=req.batch_size,
+        tp=req.tp_size,
+        pp=req.pp_size,
+        dp=req.attention_dp_size,
+        moe_tp_size=req.moe_tp_size,
+        moe_ep_size=req.moe_ep_size,
+        max_seq_len=req.max_seq_len,
+        max_num_seqs=req.max_num_seqs,
+        gpu_memory_utilization=req.gpu_memory_utilization,
+        gemm_quant_mode=req.gemm_quant_mode,
+        moe_quant_mode=req.moe_quant_mode,
+        kvcache_quant_mode=req.kvcache_quant_mode,
+        fmha_quant_mode=req.fmha_quant_mode,
+        prefix=req.prefix,
+        prefix_caching=req.prefix_caching,
+        enable_chunked_prefill=req.enable_chunked_prefill,
+        mode=req.mode,
+        decode_system=req.decode_system,
+        fabric=req.fabric,
+        prefill_max_seq_len=req.prefill_max_seq_len,
+        decode_max_seq_len=req.decode_max_seq_len,
+        prefill_gpu_memory_utilization=req.prefill_gpu_memory_utilization,
+        decode_gpu_memory_utilization=req.decode_gpu_memory_utilization,
+        prefill_tp_size=req.prefill_tp_size,
+        prefill_pp_size=req.prefill_pp_size,
+        prefill_moe_tp_size=req.prefill_moe_tp_size,
+        prefill_moe_ep_size=req.prefill_moe_ep_size,
+        prefill_batch_size=req.prefill_batch_size,
+        prefill_num_workers=req.prefill_num_workers,
+        decode_tp_size=req.decode_tp_size,
+        decode_pp_size=req.decode_pp_size,
+        decode_moe_tp_size=req.decode_moe_tp_size,
+        decode_moe_ep_size=req.decode_moe_ep_size,
+        decode_batch_size=req.decode_batch_size,
+        decode_num_workers=req.decode_num_workers,
+        model_config_provided=req.model_config_data is not None,
+        unsupported_options=unsupported_options,
+    ))
+
+
+def _blis_recommend(req: RecommendRequest):
+    configured_max = _max_candidate_gpus()
+    requested_max = req.max_candidate_gpus
+    effective_max = min(requested_max, configured_max) if requested_max is not None else configured_max
+    return run_blis_recommend(BlisRecommendInput(
+        model_path=req.model_path,
+        system=req.system,
+        backend=req.backend,
+        backend_version=req.backend_version,
+        isl=req.isl,
+        osl=req.osl,
+        concurrency=int(req.target_concurrency) if req.target_concurrency is not None else None,
+        request_rate=req.target_request_rate,
+        ttft=req.ttft,
+        tpot=req.tpot,
+        request_latency=req.request_latency,
+        prefix=req.prefix,
+        min_candidate_gpus=req.min_candidate_gpus,
+        max_candidate_gpus=effective_max,
+        top_n=req.top_n,
+        search_budget_seconds=req.search_budget_seconds,
+        max_seq_len=req.max_seq_len,
+        prefill_max_seq_len=req.prefill_max_seq_len,
+        decode_max_seq_len=req.decode_max_seq_len,
+        fabric=req.fabric,
+        database_mode=req.database_mode,
+        inclusive_tpot=req.inclusive_tpot,
+        model_config_provided=req.model_config_data is not None,
+    ))
 
 def post_predict(
     req: EstimateRequest,
@@ -1188,16 +1840,35 @@ def post_predict(
     d_moe_tp = req.decode_moe_tp_size or req.moe_tp_size
     d_moe_ep = req.decode_moe_ep_size or req.moe_ep_size
 
-    try:
-        prediction = _run_aisimulate_prediction(req, _parse_include(include))
-    except Exception as e:
-        _common_error_handler(e, "estimate", req.model_path, req.backend, req.system)
+    if req.simulator == "aisimulate":
+        try:
+            prediction, fell_back_from = _run_with_version_fallback(
+                req, lambda: _run_aisimulate_prediction(req, _parse_include(include))
+            )
+        except Exception as e:
+            _common_error_handler(e, "estimate", req.model_path, req.backend, req.system)
+    else:
+        fell_back_from = None
+        try:
+            prediction = _blis_estimate(req)
+        except (BlisUnsupportedRequest, BlisManifestError, BlisExecutionError) as e:
+            _handle_blis_error(e)
+        except Exception as e:
+            _common_error_handler(e, "estimate", req.model_path, req.backend, req.system)
 
     includes = _parse_include(include)
 
     tpot = _metric(prediction.summary, "tpot_ms", "mean_tpot_ms", "itl_ms")
     if req.inclusive_tpot:
         tpot = _inclusive_tpot(_metric(prediction.summary, "ttft_ms", "mean_ttft_ms"), tpot, req.osl)
+
+    warnings = list(getattr(prediction, "warnings", []) or [])
+    if fell_back_from and req.backend_version:
+        warnings.insert(
+            0,
+            f"No performance data for {req.backend} {fell_back_from} on {req.system}; "
+            f"used {req.backend_version}.",
+        )
 
     resp = EstimateResponse(
         ttft=_metric(prediction.summary, "ttft_ms", "mean_ttft_ms") or 0.0,
@@ -1206,7 +1877,7 @@ def post_predict(
         tokens_per_second=_metric(prediction.summary, "output_throughput_tok_s", "tokens_per_second"),
         tokens_per_second_per_gpu=_per_gpu_throughput(
             prediction.summary,
-            _coerce_int(prediction.summary.get("num_total_gpus")),
+            _prediction_total_gpus(prediction.summary, req),
         ),
         tokens_per_second_per_user=_per_user_throughput(prediction.summary, req.batch_size),
         memory=None,
@@ -1221,7 +1892,29 @@ def post_predict(
         kvcache=req.kvcache_quant_mode,
         power_w=_metric(prediction.summary, "power_w"),
         mode=req.mode,
+        simulator=req.simulator,
+        provenance=(
+            SimulatorProvenance.model_validate(prediction.provenance)
+            if getattr(prediction, "provenance", None)
+            else SimulatorProvenance(
+                simulator=req.simulator,
+                requested_model=req.model_path,
+                system=req.system,
+                engine_version=req.backend_version,
+            )
+        ),
+        warnings=warnings,
     )
+
+    if req.simulator == "blis":
+        if "config" in includes and getattr(prediction, "serving_config", None):
+            resp.serving_config = ServingConfig.model_validate(prediction.serving_config)
+        if is_disagg:
+            resp.prefill_config = WorkerConfig.model_validate(prediction.prefill_config)
+            resp.decode_config = WorkerConfig.model_validate(prediction.decode_config)
+        if "memory" in includes:
+            resp.memory_unavailable_reason = "The selected simulator does not provide a KV-cache memory breakdown."
+        return resp
 
     if is_disagg:
         # (p)/(d)memory are per-GPU peaks; the single figure is the worst case.
@@ -1338,6 +2031,7 @@ def post_memory(req: MemoryRequest):
             kv_cache_bytes=raw["total_kv_size_bytes"],
         ),
         tolerance_adjusted=raw.get("tolerance_adjusted"),
+        simulator="aisimulate",
     )
 
 
@@ -1366,24 +2060,38 @@ def _model_specs(model_id: str) -> dict:
 @app.get("/models")
 def get_models(
     include: str | None = Query(default=None, examples=["specs"], description="Comma-separated extras: specs."),
+    simulator: Literal["aisimulate", "blis"] = Query(
+        default="aisimulate",
+        description="Simulator whose model support is reported.",
+    ),
 ):
     """List supported models."""
-    models = sorted(get_default_models())
-    if include and "specs" in _parse_include(include):
-        return {"models": [_model_specs(m) for m in models]}
-    return {"models": models}
-
-
-@app.get("/systems")
-def get_systems(
-    include: str | None = Query(default=None, examples=["specs"], description="Comma-separated extras: specs."),
-):
-    """List supported GPU systems."""
     includes = _parse_include(include)
-    want_specs = "specs" in includes
+    if simulator == "blis":
+        # Only the AISimulate IDs BLIS can price. The picker offers AISimulate IDs, so
+        # a catalog-only model would be a dead option here.
+        try:
+            models = supported_model_ids()
+        except BlisManifestError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    else:
+        models = sorted(get_default_models())
+    if "specs" in includes:
+        return {"simulator": simulator, "models": [_model_specs(m) for m in models]}
+    return {"simulator": simulator, "models": models}
+
+
+def _system_entries(simulator: Literal["aisimulate", "blis"], *, want_specs: bool) -> list[dict[str, Any]]:
+    """Catalog entries for the requested simulator, in the /systems shape."""
+    system_ids = sorted(supported_systems())
+    if simulator == "blis":
+        try:
+            system_ids = supported_system_ids(system_ids)
+        except BlisManifestError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     systems = []
-    for sys_id in sorted(supported_systems()):
+    for sys_id in system_ids:
         device_name = _DEVICE_DISPLAY_NAMES.get(sys_id)
         if device_name is None:
             # No perf-data display name -> no benchmark data; hide it.
@@ -1415,7 +2123,32 @@ def get_systems(
             except Exception:
                 logger.warning("failed to load spec for %s", sys_id)
         systems.append(entry)
-    return {"systems": systems}
+    return systems
+
+
+@app.get("/systems")
+def get_systems(
+    include: str | None = Query(default=None, examples=["specs"], description="Comma-separated extras: specs."),
+    simulator: Literal["aisimulate", "blis"] = Query(
+        default="aisimulate",
+        description="Simulator whose GPU system support is reported.",
+    ),
+):
+    """List supported GPU systems."""
+    includes = _parse_include(include)
+    return {
+        "simulator": simulator,
+        "systems": _system_entries(simulator, want_specs="specs" in includes),
+    }
+
+
+@app.get("/networks")
+def get_networks():
+    """List network fabrics available to network-aware simulators."""
+    try:
+        return {"networks": sorted(load_support_manifest().networks), "simulator": "blis"}
+    except BlisManifestError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/metrics")
@@ -1431,6 +2164,19 @@ def get_metrics(request: Request):
             detail="Metrics unavailable (install with: pip install '.[otel]')",
         )
     return observability.metrics_response(request.headers.get("accept", "text/plain"))
+
+
+# ─── MCP ─────────────────────────────────────────────────────────────────────
+
+# Expose the API as MCP tools if the optional extra is present. Mounted after
+# every route: fastapi-mcp snapshots the routes when the server is built, so a
+# route declared below this block would not become a tool.
+_MCP_SERVER = None
+if _MCP:
+    _MCP_SERVER = mcp_support.mount(app, name="aisimulators",
+                                    description="GPU recommendation and performance estimation for LLM inference")
+else:
+    logger.info("MCP server unavailable (install with: pip install '.[mcp]')")
 
 
 # ─── Entrypoint ──────────────────────────────────────────────────────────────

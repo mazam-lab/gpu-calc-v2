@@ -15,11 +15,14 @@ interface RecommendParams {
   ttft: number;
   tpot?: number;
   backend?: string;
+  backend_version?: string;
   target_concurrency?: number;
   target_request_rate?: number;
   request_latency?: number;
   prefix?: number;
   model_config?: Record<string, unknown> | null;
+  simulator?: 'aisimulate' | 'blis';
+  fabric?: string | null;
 }
 
 interface RecommendState {
@@ -105,6 +108,7 @@ export function RecommendProvider({ children }: { children: React.ReactNode }) {
     if (p.prefill_max_seq_len != null) requestBody.prefill_max_seq_len = p.prefill_max_seq_len;
     if (p.decode_max_seq_len != null) requestBody.decode_max_seq_len = p.decode_max_seq_len;
     if (p.backend) requestBody.backend = p.backend;
+    if (p.backend_version) requestBody.backend_version = p.backend_version;
     if (p.target_request_rate != null) {
       delete requestBody.target_concurrency;
       requestBody.target_request_rate = p.target_request_rate;
@@ -112,6 +116,8 @@ export function RecommendProvider({ children }: { children: React.ReactNode }) {
     if (p.request_latency != null) requestBody.request_latency = p.request_latency;
     if (p.prefix != null && p.prefix > 0) requestBody.prefix = p.prefix;
     if (p.model_config != null) requestBody.model_config = p.model_config;
+    if (p.simulator) requestBody.simulator = p.simulator;
+    if (p.fabric !== undefined) requestBody.fabric = p.fabric;
 
     setParams(p);
     setIsLoading(true);

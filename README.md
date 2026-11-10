@@ -7,7 +7,7 @@ LLM inference sizing, GPU comparison, and cost modeling for engineers and infras
 - [configiq.xyz](https://configiq.xyz) (latest release)
 - [configiq.dev](https://configiq.dev) (latest commit)
 
-Built with Next.js + PatternFly, powered by our [AISimulators](https://github.com/ai-dynamo/aisimulate) [REST API](https://aisimulators.dev/docs).
+Built with Next.js + PatternFly, powered by the [AISimulators REST API](https://aisimulators.dev/docs) for multi-simulator sizing and estimation.
 
 ## What it does
 
@@ -19,6 +19,22 @@ Built with Next.js + PatternFly, powered by our [AISimulators](https://github.co
 | **GPU Explorer** | Compare GPUs across memory, throughput, cost, and availability |
 | **Hybrid Savings** | Model cost savings across cloud, on-premise, and hybrid strategies |
 | **Routing Economics** | Analyze request routing between model tiers |
+| **Cluster cost** | Estimate costs for multi-node GPU clusters |
+
+## Tested-model validation
+
+ConfigIQ maintains empirically trained performance-envelope classifiers for
+supported model and hardware pairs. The classifiers are built from sanitized,
+pinned ground-truth data and served by Triton FIL; the webapp consumes their
+registry and dashboard payloads through `/api/tested-models`. Registry schema v2
+distinguishes validated classifiers from measured pairs without a validated
+envelope, and from models that are approved for measurement but have no data.
+Only validated pairs emit a verdict; every measured pair links to its graph at
+`/tested-models/<pair-id>`.
+
+The complete pipeline, data boundary, artifact schema, and deployment procedure
+are documented in [docs/tested-models.md](docs/tested-models.md). Source scripts
+and regression tests are under [scripts/tested_models](scripts/tested_models).
 
 ## Getting started
 
@@ -30,7 +46,7 @@ Built with Next.js + PatternFly, powered by our [AISimulators](https://github.co
 ### Setup
 
 ```bash
-git clone https://github.com/openshift-psap/configiq.git
+git clone https://github.com/redhat-performance/configiq.git
 cd configiq
 npm install
 cp .env.example .env.local
@@ -46,15 +62,16 @@ npm run dev          # Start dev server (http://localhost:3000)
 npm run build        # Production build
 npm run type-check   # TypeScript check without building
 npm run lint         # ESLint
+npm test             # Vitest test suite
 ```
 
 ## Tech stack
 
 | Layer | Technology |
 |-------|-----------|
-| Framework | Next.js 14 App Router + TypeScript |
-| UI | PatternFly v5 |
-| Backend API | [AISimulators](https://aisimulators.dev/docs) (GPU sizing + memory estimation) |
+| Framework | Next.js 16 App Router + TypeScript |
+| UI | PatternFly v6 |
+| Backend APIs | [AISimulators](https://aisimulators.dev/docs) for multi-simulator sizing, estimation, and capabilities; aicostings for pricing |
 
 ## Project structure
 
@@ -69,26 +86,31 @@ app/                  Next.js App Router pages
   hybrid-savings/     Hybrid Savings
   routing/            Routing Economics
   settings/           App settings
-  api/                Next.js API routes (proxy to REST APIs)
+  api/                Next.js same-origin proxies and application APIs
     recommend/        POST — GPU sizing via AISimulators /recommend
     predict/          POST — GPU performance via AISimulators /predict
     memory/           POST — memory breakdown via AISimulators /memory
     gpus/             GET — GPU catalog via AISimulators /systems
+    catalog/          GET — combined systems, models, backends, and network-fabrics catalog
+    estimate/         POST — compatibility alias for predict
     hf-config/        GET — Hugging Face model config lookup
     health/           GET — health check
+    costings/         Pricing-service proxies
+    metrics/          Application metrics
 components/
   layout/
     AppShell.tsx      Top-nav masthead + sidebar navigation
 lib/
-  api/                AISimulators API clients
+  api/                AISimulators and aicostings API clients
 docs/                 Architecture docs and ADRs
+scripts/tested_models/ Tested-model dataset, classifier, and artifact pipeline
 ```
 
 ## Contributing
 
 ### Before opening a PR
 
-CI runs automatically and must pass:
+Run these checks before opening a PR:
 
 ```bash
 npm run type-check   # Must be clean
@@ -99,8 +121,8 @@ npm run build        # Must succeed
 ### Code conventions
 
 1. **GPU math belongs in `aisimulators`** — never write sizing formulas inside React components.
-1. **Pricing belongs in the `aicostings` service** — never add costing inside React components.
-2. **PatternFly only** — do not add Tailwind, shadcn/ui, or any other component library.
-3. **Sentence case everywhere** — no title case in headings or labels.
-4. **Server components by default** — add `"use client"` only when needed.
-5. **No `any` types** — TypeScript strict mode is enforced.
+2. **Pricing belongs in the `aicostings` service** — never add costing inside React components.
+3. **PatternFly only** — do not add Tailwind, shadcn/ui, or any other component library.
+4. **Sentence case everywhere** — no title case in headings or labels.
+5. **Server components by default** — add `"use client"` only when needed.
+6. **No `any` types** — TypeScript strict mode is enforced.

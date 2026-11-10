@@ -8,11 +8,12 @@ Read this before making any changes.
 ConfigIQ is a web application for LLM inference sizing, GPU comparison, and
 cost modeling. It is deployed at configiq.dev and uses the AISimulators
 REST API (server URL set via `AISIMULATORS_GATEWAY_URL`, e.g.
-`https://aisimulators.dev`) for GPU recommendations and memory estimation.
+`https://aisimulators.dev`) for simulator-backed recommendations, performance
+predictions, memory estimates, and capability catalogs.
 
 ## Tech stack
 
-- **Framework**: Next.js 15 App Router + TypeScript
+- **Framework**: Next.js 16 App Router + TypeScript
 - **UI**: PatternFly v6 (Red Hat's design system) — no Tailwind, no shadcn
 - **Charts**: PatternFly Victory Charts
 - **Fonts**: Red Hat Display (headings, metrics), Red Hat Text (body), Red Hat Mono (numbers, code, labels)
@@ -51,13 +52,17 @@ app/                    # Next.js App Router pages
   hybrid-savings/       # Hybrid Savings tool
   routing/              # Routing Economics tool
   settings/             # App settings
-  api/                  # Next.js API routes — proxy to AISimulators REST API
+  api/                  # Next.js API routes — same-origin proxies and app APIs
     recommend/          # POST — GPU sizing
     predict/            # POST — GPU performance
     memory/             # POST — memory breakdown
-    gpus/               # GET — GPU catalog + optional live pricing
+    gpus/               # GET — GPU catalog from AISimulators
+    catalog/            # GET — combined systems/models/backends/network-fabrics catalog
+    estimate/           # POST — compatibility alias for predict
     hf-config/          # GET — Hugging Face model config lookup
     health/             # GET — health check
+    costings/           # Proxies for the aicostings pricing service
+    metrics/             # GET — application metrics
 components/
   layout/
     AppShell.tsx        # Page shell with sidebar nav
@@ -65,7 +70,7 @@ lib/
   gpu-math/             # Legacy client-side GPU sizing — historical/fallback only
   api/                  # AISimulators API clients — source of truth for GPU math
   pricing/              # Cloud GPU pricing data
-  hooks/                # useAicCatalog → /api/catalog, useCostings →
+  hooks/                # useCatalog → /api/catalog, useCostings →
                         # /api/costings/* — both go through same-origin api/
                         # proxies (server-side gateway env), no direct external
                         # fetches from the browser
@@ -74,20 +79,18 @@ lib/
 docs/                   # Architecture docs and ADRs
 public/                 # Static assets
 services/               # Backend Python microservices (FastAPI), built as
-                        # their own container images, released in unison with
-                        # the frontend (see .github/workflows/build.yml)
+                         # their own container images
   configiq-py/          # Shared Python library (import name: configiq):
                         # GPU systems catalog, OpenTelemetry + MCP wiring.
                         # Consumed by the services below as a uv path dependency.
-  aisimulators/       # Thin FastAPI wrapper over the aisimulate SDK
-                        # (GPU sizing, performance + memory estimation)
+  aisimulators/        # FastAPI boundary for AISimulate and BLIS simulator APIs
   aicostings/           # GPU + LLM pricing API (scrapes providers into Valkey)
 ```
 
 The `services/` tree is Python (FastAPI + uv), separate from the Next.js
-frontend at the repo root. GPU math still lives in the aisimulate SDK — the
-`aisimulators` service is only a REST wrapper. See each service's `README.md`
-for details.
+frontend at the repo root. AISimulators wraps the aisimulate SDK for
+AISimulate calculations and runs the pinned BLIS runtime for BLIS calculations.
+See each service's `README.md` for details.
 
 ## Critical rules
 
@@ -112,6 +115,65 @@ for details.
 
 6. **Follow the design system** — see [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) for typography, colors, spacing, components, and patterns. Don't invent new styles or components without checking the design system first.
 
+## Multi-simulator contracts
+
+ConfigIQ can use more than one simulator. Keep simulator identity separate from
+the serving engine being modeled:
+
+- **`simulator`** identifies the implementation producing an estimate or
+  recommendation (currently AISimulate or BLIS).
+- **`backend`** identifies the serving runtime being modeled (for example,
+  vLLM, SGLang, or TensorRT-LLM). Do not use `backend` to mean simulator, and
+  keep the public request field named `simulator`.
+
+Keep API and UI contracts simulator-neutral wherever the concept is shared:
+
+- Prefer domain names such as `/memory`, `/networks`, and `networkFabric` over
+  simulator-branded endpoint, field, state, or control names. A network fabric
+  is a hardware/topology choice, not a simulator setting. Simulator-specific
+  support belongs in capability metadata and documentation, not in the name of
+  the physical resource.
+- When a capability is available from only some simulators, say so explicitly
+  in the API description and response. Include the actual `simulator` in
+  results; do not make clients infer which implementation supplied optional
+  fields. For example, `/memory` is currently AISimulate-provided and
+  `/networks` currently lists fabrics used by BLIS.
+- A requested simulator must either produce a result from that simulator or
+  return an explicit unsupported/error response. Never silently substitute a
+  different simulator. Clients should validate response provenance when a
+  specific simulator was requested.
+- Optional capability data must be represented as available/unavailable, with
+  a reason when useful. Never fabricate memory, topology, transfer, or
+  performance values to make simulator results look uniform.
+- Treat topology values as user-visible assumptions. A default fabric must be
+  named, shown in the UI, overrideable, and have documented null/omission
+  semantics. Do not infer a P/D transfer bandwidth from a GPU's
+  `inter_node_bw` unless the selected simulator's contract explicitly does so.
+  In particular, AISimulate omitting `engine.kv_transfer` means no modeled P/D
+  transfer delay; it does not imply a RoCE or InfiniBand default.
+
+For UI and integration work:
+
+- Keep simulator selection global in Settings, enforce supported simulator /
+  inference-backend combinations there, and validate them again at the API
+  boundary.
+- Reuse shared page controls and result components (including the simulator
+  badge). Do not reset unrelated user inputs or add simulator-specific page
+  behavior merely because a different simulator is selected. Add a
+  capability-specific control only when it represents a real workload or
+  topology input, such as the fabric for a BLIS P/D request.
+- Route browser requests through same-origin `app/api/` proxies. Keep simulator
+  selection and capability handling in the API client/service boundary, not in
+  duplicated sizing logic in React.
+
+When adding or changing a simulator integration, update the service README and
+OpenAPI contract, document supported and rejected request shapes, and test:
+requested-simulator propagation, actual-simulator reporting, compatible
+backend selection, optional-field availability, and unsupported requests with
+no fallback. Treat the service-specific documentation as the source of the
+current capability matrix rather than assuming all simulators support the same
+features.
+
 ## Commands
 
 ```bash
@@ -120,6 +182,12 @@ npm run build      # Production build
 npm run lint       # ESLint
 npm run type-check # TypeScript check without build
 ```
+
+### Commits
+
+Every commit must carry a `Signed-off-by:` trailer matching the committer
+identity. Use `git commit -s` (or `git commit --amend -s` to fix an existing
+commit).
 
 ## Typography & color (legibility rules)
 
@@ -172,7 +240,7 @@ that must be preserved:
 
 - **Flip tiles** — result tiles flip on click/Enter to reveal formulas. Use
   opacity + rotateY (not bare backface-visibility) for robust cross-browser flip.
-- **Count-up animation** — headline numbers animate from 0 on load with 1500ms
+- **Count-up animation** — headline numbers animate from 0 on load with 750ms
   ease-out timing. Must respect `prefers-reduced-motion`.
 - **Sparkline** — GPU tile shows GPUs-vs-concurrency mini line chart (SVG).
 - **Glossary popovers** — every jargon term (KV cache, max_num_seqs, tensor
@@ -196,3 +264,13 @@ complete interaction inventory.
 - Tailwind CSS
 
 These will be added in later phases when there is a real requirement for them.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->
