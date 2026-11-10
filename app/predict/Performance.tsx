@@ -38,8 +38,7 @@ import { useCatalog, systemMemoryFraction, engineVersionSupport, type ModelSpec 
 import { useTestedModels } from '@/lib/hooks/useTestedModels';
 import { testedSystemsFirst } from '@/lib/tested-models/registry-types';
 import { ErrorPanel } from '@/components/ui/ErrorPanel';
-// import { WarningPanel } from '@/components/ui/WarningPanel';
-//import { useAicCatalog, type ModelSpec } from '@/lib/hooks/useAicCatalog';
+import { WarningPanel } from '@/components/ui/WarningPanel';
 import { GpuChipLoader } from '@/components/GpuChipLoader/GpuChipLoader';
 import { useSettings } from '@/contexts/SettingsContext';
 import { useCostings, resolveCloudRate } from '@/lib/hooks/useCostings';
@@ -1532,7 +1531,7 @@ export default function Performance() {
       )}
 
       {/* ---------- validation warnings ---------- */}
-      {/* <WarningPanel warnings={validationWarnings} /> */}
+      <WarningPanel warnings={validationWarnings} />
 
       {/* ---------- error display ---------- */}
       {testError && <ErrorPanel error={testError} errorCode={testErrorCode} />}

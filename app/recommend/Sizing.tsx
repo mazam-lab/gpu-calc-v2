@@ -12,7 +12,7 @@ import DollarSignIcon from '@patternfly/react-icons/dist/esm/icons/dollar-sign-i
 import { InfoStrip, InfoStripAction } from '@/components/ui/InfoStrip';
 import { DebugPanel } from '@/components/DebugPanel/DebugPanel';
 import { ErrorPanel } from '@/components/ui/ErrorPanel';
-// import { WarningPanel } from '@/components/ui/WarningPanel';
+import { WarningPanel } from '@/components/ui/WarningPanel';
 
 import styles from './Sizing.module.css';
 import { fetchModelConfig } from '@/lib/huggingface/fetch-config';
@@ -1079,7 +1079,7 @@ export default function Sizing() {
           {/* Memory layout bar hidden — local estimates don't match API internals */}
 
           {/* ─── Warnings ─── */}
-          {/* <WarningPanel warnings={result.warnings.map(w => w.message)} /> */}
+          <WarningPanel warnings={result.warnings.map(w => w.message)} />
         </>
       )}
 
